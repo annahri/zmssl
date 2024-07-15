@@ -1,0 +1,512 @@
+#!/bin/bash
+# zmssl
+# author: ahfas.annahri@gmail.com
+
+version="0.2"
+
+# Variables
+lock_file=/tmp/zmssl_lock
+noninteractive=
+domains=()
+renew_days=14
+le_opts=()
+le_email=
+le_cert_name="zimbra-ssl"
+le_dir="/etc/letsencrypt/live/${le_cert_name}"
+le_forcegetcert=
+zm_ssl_dir="/opt/zimbra/ssl/letsencrypt"
+zm_comm_dir="/opt/zimbra/ssl/zimbra/commercial"
+zm_certfile="${zm_ssl_dir}/cert.pem"
+zm_privkeyfile="${zm_ssl_dir}/privkey.pem"
+zm_chainfile="${zm_ssl_dir}/chain-bundle.pem"
+seed=$(head /dev/urandom | tr -dc A-Za-z0-9 | head -c 6)
+
+usage() {
+    cat <<EOF
+zmssl v$version by annahri
+CLI tool for automating Let'sEncrpt SSL certificate issuance and deployment for Zimbra. (Initially written for Zimbra >= 9).
+This script requires "certbot" as the ACME client.
+
+USAGE: zmssl [options] <action> -d ...
+
+ACTIONS:
+  run           Gets the cert + chain and deploys it.
+  cron          Same as run but checks for expiry first. 
+  deploy        Only deploy existing cert or arbitrary one (via --cert).
+  get-cert      Only gets the certificate.
+  check-expiry  Checks the cert expiry remaining days.
+  build-chain   Build the certificate chain.
+
+OPTIONS:
+  -d --domain <domain>  Domain names. Can be set multiple times for SAN. Required for: run, cron.
+  -c --cert <file>      Specify custom certificate file instead of LE's live cert.
+  -C --chain <file>     Specify custom chain file instead of LE's live chain bundle.
+  -p --priv <file>      Specify custom private key file instead of LE's live privkey. 
+  -n --name <name>      Set the name of the certificate. Default: zimbra-ssl.
+  -e --email <address>  Specify email address for ACME. Optional.
+  -w --days <int>       Set the days within renewal. Cannot be higher than 30. Dafault: 14 (2 weeks)
+  
+  --force-getcert       Force to get the certificate even if it's not within renewal days.
+  --force-getchain      Force to "re-create" the chain bundle.
+  --noconfirm           Auto approve all prompts.
+
+  -h --help             Display this help information.
+
+LIMITATIONS:
+  Currently, the only supported domain control validation method is HTTP validation. 
+
+EXAMPLES:
+  Interactively get a certificate named "production" for mail.example.com and mail.example.id, 
+  deploys it and restarts Zimbra services. Also send expiry notifications to admin@example.com:
+
+    ./zmssl run -n production -d mail.example.com -d mail.example.id -e admin@example.com
+
+  Certbot will store the certificates in /etc/letsencrypt/live/production
+
+  Deploy a certificate using custom name:
+    ./zmssl deploy -n custom-name
+
+  Sample cron configuration to do renewal every 30 days, weekly checking:
+  50 23 * * 6 /path/to/zmssl cron -n <pre-existing-le-cert-dir> -d <domains ...> -e <mail> -w 30
+
+EXTRA:
+  For testing purposes, set ZMSSL_STAGING environment variable to true.
+EOF
+    exit
+}
+
+err() {
+    echo "ERROR: $*" >&2
+}
+
+warn() {
+    echo "WARN: $*" >&2
+}
+
+die() {
+    err "$@"
+    exit 1
+}
+
+stage() {
+    local nl=""
+    local icon="☐"
+    if [[ "$action" == "cron" ]]; then
+        nl="\n"
+        icon=">"
+    fi
+
+    printf "$icon %s$nl" "$*" >&2
+}
+
+stage_result() {
+    local length
+    local nl="\n"
+    local status="$1"
+    shift
+
+    case "$status" in
+    ok) box="☑" ;;
+    fail) box="☒" ;;
+    nop)
+        box="☐"
+        nl=""
+        ;;
+    esac
+
+    if [[ "$action" == "cron" ]]; then
+        box=">"
+    fi
+
+    length=$(tput cols)
+    printf "\r%*s\r%s %s$nl" "$length" "" "$box" "$*" >&2
+}
+
+prompt() {
+    [[ -n "$noninteractive" ]] && return
+
+    read -rp "$*. Enter Y/y to continue: " response
+    [[ $response =~ ^[Yy]$ ]] || exit 1
+}
+
+dependency_check() {
+    command -v certbot &>/dev/null || die "Please install certbot"
+}
+
+run_as() {
+    local tmplog="/tmp/zmssl_${1}_${seed}"
+    # shellcheck disable=SC2024
+    sudo -inu zimbra -- "$@" &>>"$tmplog"
+}
+
+cp_as() {
+    install --owner zimbra --group zimbra --mode 640 --preserve-timestamps "$1" "$2"
+}
+
+is_port_free() {
+    local port="$1"
+    ! : &>/dev/null </dev/tcp/localhost/"$port"
+}
+
+zmproxy_start() {
+    if run_as zmproxyctl status | grep -q 'is running.'; then
+        echo "Proxy is already running"
+        return
+    fi
+
+    stage "Starting Zimbra Proxy"
+    run_as zmproxyctl start
+    stage_result ok "Started Zimbra Proxy"
+}
+
+zmproxy_stop() {
+    if run_as zmproxyctl status | grep -q 'not running.'; then
+        echo "Proxy is already stopped"
+        return
+    fi
+
+    stage "Stopping Zimbra Proxy"
+    run_as zmproxyctl stop
+    stage_result ok "Stopped Zimbra Proxy"
+}
+
+cert_cn_get() {
+    openssl x509 -in "$chain_file" -noout -subject -nameopt multiline | awk -F' = ' '/commonName/ {print $2}'
+}
+
+cert_check_expiry() {
+    if [[ -n "$le_forcegetcert" ]]; then
+        echo "The --force-getcert is used, skipping certificate expiry check"
+        return
+    fi
+
+    local target_cert="${zm_comm_dir}/commercial.crt"
+    local expiry_date expiry_timestamp current_timestamp remaining
+
+    if [[ ! -f "$zm_certfile" ]]; then
+        die "Please get the initial certificate first (missing cert.pem) or invalid file"
+    fi
+
+    if ! cmp -s <(cat "${zm_certfile}" "${zm_chainfile}") "${zm_comm_dir}/commercial.crt"; then
+        warn "The certificate hasn't been deployed (!)"
+        target_cert="${zm_certfile}"
+    fi
+
+    expiry_date=$(openssl x509 -noout -enddate -in "$target_cert" | cut -d= -f2)
+    expiry_timestamp=$(date -d "$expiry_date" +%s)
+    current_timestamp=$(date +%s)
+    remaining=$(((expiry_timestamp - current_timestamp) / 86400))
+
+    if [[ $remaining -le $renew_days ]]; then # within renewal days
+        warn "The expiry days left ($remaining) is within renewal days ($renew_days)."
+        return
+    fi
+
+    echo "Certificate $le_cert_name will expire in: $remaining day(s)" >&2
+    return 1
+}
+
+cert_get() {
+    # Accepts 1 argument (either 0 or 1), if given 1 then proxy won't started after being stopped.
+
+    local certbot_log
+    local return_status=0
+    local no_proxy_start="${1:-0}"
+    local proxy_stopped=0
+
+    certbot_log="/tmp/zmssl_certbot_$(date +%s).log"
+
+    if [[ "${#domains[@]}" -eq 0 ]]; then
+        die "Please specify the domain name(s): -d domain ..."
+    fi
+
+    # If supported, then prefer using ISRG Root X2
+    if certbot --help certonly | grep -q preferred-chain; then
+        le_opts+=(--preferred-chain "ISRG Root X2")
+    fi
+
+    for domain in "${domains[@]}"; do
+        le_domains+=(-d "$domain")
+    done
+
+    prompt "Getting certificate requires stopping Zimbra proxy."
+
+    if ! is_port_free 80; then
+        zmproxy_stop
+        proxy_stopped=1
+    fi
+
+    stage "Requesting certificate for: ${domains[*]}"
+    if ! certbot certonly \
+        --standalone \
+        --non-interactive \
+        --agree-tos \
+        --cert-name "$le_cert_name" \
+        "${le_opts[@]}" \
+        "${le_domains[@]}" &>"$certbot_log"; then
+        stage_result fail "Failed to get certificate. Check $certbot_log for more details."
+        zmproxy_start
+        exit 1
+    fi
+
+    if grep -q "Certificate not yet due for renewal" "$certbot_log"; then
+        stage_result nop "Certificate not yet due for renewal"
+        return_status=1
+    else
+        stage_result ok "Certificate has been issued successfully"
+    fi
+
+    cp_as "${le_dir}/cert.pem" "${zm_ssl_dir}/"
+    cp_as "${le_dir}/privkey.pem" "${zm_ssl_dir}/"
+
+    if [[ "$no_proxy_start" -eq 0 && "$proxy_stopped" -eq 1 ]]; then
+        zmproxy_start
+    fi
+
+    return "$return_status"
+}
+
+cert_get_chain() {
+    if [[ -d "$le_dir" ]]; then
+        die "Certificate $le_cert_name doesn't exist. Please issue a certificate for it."
+    fi
+
+    local root_ca_url
+    local chain_file="${le_dir}/chain.pem"
+    stage "Getting certificate chain"
+
+    if [[ -f "$zm_chainfile" && -z "${le_forcegetchain}" ]]; then
+        stage_result nop "Overwriting existing chain bundle"
+    fi
+
+    if [[ ! -f "$chain_file" ]]; then
+        die "Please get the initial certificate first"
+    fi
+
+    # Gets the chain's CN and gets the appropriate root based on it
+    root_cn=$(openssl x509 -in "$chain_file" -noout -subject -nameopt multiline | awk -F= '/commonName/ {print $2}' | awk '{$1=$1};1')
+
+    case "$root_cn" in
+    R*) root_ca_url=https://letsencrypt.org/certs/isrgrootx1.pem ;;
+    E*) root_ca_url=https://letsencrypt.org/certs/isrg-root-x2.pem ;;
+    *STAGING*)
+        if [[ "$root_cn" =~ \(STAGING\).*(R|E)[0-9]+$ ]]; then
+            case "${BASH_REMATCH[1]}" in
+            R) root_ca_url="https://letsencrypt.org/certs/staging/letsencrypt-stg-root-x1.pem" ;;
+            E) root_ca_url="https://letsencrypt.org/certs/staging/letsencrypt-stg-root-x2.pem" ;;
+            esac
+        fi
+        ;;
+    esac
+
+    if {
+        curl -Sso /tmp/ISRG-root.pem "$root_ca_url"
+        cat "$chain_file" /tmp/ISRG-root.pem >"$zm_chainfile"
+        chown zimbra:zimbra "$zm_chainfile"
+    }; then
+        stage_result ok "Chain has been combined"
+    else
+        stage_result fail "Failed to combine chain"
+    fi
+
+    rm -f /tmp/ISRG-root.pem
+}
+
+cert_verify() {
+    if [[ ! -f "$zm_certfile" ]]; then
+        die "Please get the initial certificate first (missing cert.pem) or invalid file"
+    fi
+
+    if [[ ! -f "$zm_privkeyfile" ]]; then
+        die "Please get the initial certificate first (missing privkey.pem) or invalid file"
+    fi
+
+    if [[ ! -f "$zm_chainfile" ]]; then
+        die "Please get the root chain (missing chain-bundle.pem) or invalid file"
+    fi
+
+    stage "Verifying certificate"
+    if ! run_as zmcertmgr verifycrt comm "$zm_privkeyfile" "$zm_certfile" "$zm_chainfile"; then
+        stage_result fail "Verification failed. Check the latest log in /tmp/zmssl_zmcertmgr_$seed"
+        exit 1
+    fi
+
+    stage_result ok "Verification successful"
+}
+
+cert_deploy() {
+    stage "Deploying certificate"
+    cp_as "${zm_privkeyfile}" "${zm_comm_dir}/commercial.key"
+
+    if ! run_as zmcertmgr deploycrt comm "$zm_certfile" "$zm_chainfile"; then
+        stage_result fail "Deployment failed. Check the latest log in /tmp/zmssl_zmcertmgr_$seed"
+        exit 1
+    fi
+
+    stage_result ok "Deployment successful"
+}
+
+services_restart() {
+    if [[ "$norestart" -eq 1 ]]; then
+        echo "You can manually restart the services via:"
+        echo "  sudo -iu zimbra -- zmcontrol restart"
+        return
+    fi
+
+    prompt "About to restart Zimbra services"
+
+    stage "Restarting Zimbra services"
+    if ! run_as zmcontrol restart; then
+        stage_result fail "Failed to restart Zimbra services. Check /tmp/zmssl_zmcontrol_$seed for details"
+        exit 1
+    fi
+    stage_result ok "Restarted Zimbra services"
+}
+
+parse_args() {
+    [[ $# -eq 0 ]] && usage
+
+    while [[ $# -ne 0 ]]; do
+        case "$1" in
+        -c | --cert)
+            [[ ! -f "$2" ]] && die "Invalid certificate file."
+            zm_certfile="$2"
+            shift
+            ;;
+        -C | --chain)
+            [[ ! -f "$2" ]] && die "Invalid chain file."
+            zm_chainfile="$2"
+            shift
+            ;;
+        -p | --priv)
+            [[ ! -f "$2" ]] && die "Invalid private key file."
+            zm_privkeyfile="$2"
+            shift
+            ;;
+        -n | --name)
+            le_cert_name="$2"
+            shift
+            ;;
+        -e | --email)
+            le_email="$2"
+            shift
+            ;;
+        -w | --days)
+            [[ "$2" -gt 30 ]] && die "Let's Encrypt renewal period starts from 30 days before expiry. Cannot be higher than that, unless --force-getcert is set."
+            renew_days="$2"
+            shift
+            ;;
+        -d | --domain)
+            domains+=("$2")
+            shift
+            ;;
+        --force-getcert) le_forcegetcert=1 ;;
+        --force-getchain) le_forcegetchain=1 ;;
+        --noconfirm) noninteractive=1 ;;
+        --norestart) norestart=1 ;;
+        -h | --help) usage ;;
+        *)
+            if [[ -n "$action" ]]; then
+                die "Unknown option: $1"
+            fi
+
+            case "$1" in
+            cron | run | deploy | build-chain | get-cert | check-expiry | verify-cert)
+                action="$1"
+                ;;
+            *)
+                positional+=("$1")
+                ;;
+            esac
+            ;;
+        esac
+        shift
+    done
+
+    le_dir="/etc/letsencrypt/live/${le_cert_name}"
+}
+
+info() {
+    [[ "${domains[*]}" ]] &&
+        echo "                        Domains : ${domains[*]}"
+    [[ "$le_email" ]] &&
+        echo "    Let's Encrypt email address : $le_email"
+    echo " Let's Encrypt Certificate name : $le_cert_name"
+    echo "               Certificate file : $zm_certfile"
+    echo "                     Chain file : $zm_chainfile"
+    echo "               Private key file : $zm_privkeyfile"
+    prompt "Ensure the values are correct."
+}
+
+main() {
+    parse_args "$@"
+    mkdir -p "$zm_ssl_dir"
+
+    if [[ -f "$lock_file" ]]; then
+        die "Another instance is already running."
+    fi
+
+    touch "$lock_file"
+    trap 'rm -f "$lock_file"' EXIT
+
+    # If ZMSSL_STAGING is set then it's staging and add staging flags for certbot
+    if [[ -n "$ZMSSL_STAGING" ]]; then
+        le_opts+=(--staging --break-my-certs)
+        echo "ZMSSL_STAGING is set. Running in STAGING mode." >&2
+    fi
+
+    # If le_email is not set, add the appropriate flag for certbot
+    if [[ -z "$le_email" ]]; then
+        le_opts+=(--register-unsafely-without-email)
+    else
+        le_opts+=(--email "$le_email")
+    fi
+
+    if [[ -n "$le_forcegetcert" ]]; then
+        le_opts+=(--force-renewal)
+    fi
+
+    case "$action" in
+    run)
+        info
+        cert_get 1
+        cert_get_chain
+        cert_verify
+        cert_deploy
+        services_restart
+        ;;
+    cron)
+        noninteractive=1
+        cert_check_expiry || exit
+        cert_get 1
+        cert_get_chain
+        cert_verify
+        cert_deploy
+        services_restart
+        ;;
+    deploy)
+        cert_verify
+        cert_deploy
+        echo "Do manual services restart: sudo -inu zimbra -- zmcontrol restart" >&2
+        ;;
+    get-cert)
+        info
+        cert_get 0
+        cert_get_chain
+        ;;
+    build-chain)
+        cert_get_chain
+        ;;
+    check-expiry)
+        unset le_forcegetcert
+        cert_check_expiry
+        ;;
+    verify-cert)
+        cert_verify
+        ;;
+    esac
+
+    rm -f "$lock_file"
+}
+
+main "$@"
