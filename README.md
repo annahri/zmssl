@@ -53,4 +53,5 @@ EXTRA:
 
 ## TODO
 
+- Mail notification upon failures/successes
 - Fix bugs!!
