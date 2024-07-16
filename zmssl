@@ -11,7 +11,8 @@ domains=()
 renew_days=14
 le_opts=()
 le_email=
-le_cert_name="zimbra-ssl"
+le_cert_name_default="zimbra-ssl"
+le_cert_name="$le_cert_name_default"
 le_dir="/etc/letsencrypt/live/${le_cert_name}"
 le_forcegetcert=
 zm_ssl_dir="/opt/zimbra/ssl/letsencrypt"
@@ -267,7 +268,7 @@ cert_get() {
 }
 
 cert_get_chain() {
-    if [[ -d "$le_dir" ]]; then
+    if [[ ! -d "$le_dir" ]]; then
         die "Certificate $le_cert_name doesn't exist. Please issue a certificate for it."
     fi
 
@@ -313,6 +314,12 @@ cert_get_chain() {
 }
 
 cert_verify() {
+    # If le_cert_name isn't the default ones, then it's manually set thus copy certs to zm_ssl_dir
+    if [[ "$le_cert_name" != "$le_cert_name_default" && -d "$le_dir" ]]; then
+        cp_as "${le_dir}/cert.pem" "${zm_ssl_dir}/"
+        cp_as "${le_dir}/privkey.pem" "${zm_ssl_dir}/"
+    fi
+
     if [[ ! -f "$zm_certfile" ]]; then
         die "Please get the initial certificate first (missing cert.pem) or invalid file"
     fi
