@@ -22,7 +22,7 @@ zm_chainfile="${zm_ssl_dir}/chain-bundle.pem"
 seed=$(head /dev/urandom | tr -dc A-Za-z0-9 | head -c 6)
 
 usage() {
-    cat <<EOF
+    cat << EOF
 zmssl v$version by annahri
 CLI tool for automating Let'sEncrpt SSL certificate issuance and deployment for Zimbra. (Initially written for Zimbra >= 9).
 This script requires "certbot" as the ACME client.
@@ -106,12 +106,12 @@ stage_result() {
     shift
 
     case "$status" in
-    ok) box="☑" ;;
-    fail) box="☒" ;;
-    nop)
-        box="☐"
-        nl=""
-        ;;
+        ok) box="☑" ;;
+        fail) box="☒" ;;
+        nop)
+            box="☐"
+            nl=""
+            ;;
     esac
 
     if [[ "$action" == "cron" ]]; then
@@ -130,13 +130,13 @@ prompt() {
 }
 
 dependency_check() {
-    command -v certbot &>/dev/null || die "Please install certbot"
+    command -v certbot &> /dev/null || die "Please install certbot"
 }
 
 run_as() {
     local tmplog="/tmp/zmssl_${1}_${seed}"
     # shellcheck disable=SC2024
-    sudo -inu zimbra -- "$@" &>>"$tmplog"
+    sudo -inu zimbra -- "$@" &>> "$tmplog"
 }
 
 cp_as() {
@@ -145,7 +145,7 @@ cp_as() {
 
 is_port_free() {
     local port="$1"
-    ! : &>/dev/null </dev/tcp/localhost/"$port"
+    ! : &> /dev/null < /dev/tcp/localhost/"$port"
 }
 
 zmproxy_start() {
@@ -243,7 +243,7 @@ cert_get() {
         --agree-tos \
         --cert-name "$le_cert_name" \
         "${le_opts[@]}" \
-        "${le_domains[@]}" &>"$certbot_log"; then
+        "${le_domains[@]}" &> "$certbot_log"; then
         stage_result fail "Failed to get certificate. Check $certbot_log for more details."
         zmproxy_start
         exit 1
@@ -287,21 +287,21 @@ cert_get_chain() {
     root_cn=$(openssl x509 -in "$chain_file" -noout -subject -nameopt multiline | awk -F= '/commonName/ {print $2}' | awk '{$1=$1};1')
 
     case "$root_cn" in
-    R*) root_ca_url=https://letsencrypt.org/certs/isrgrootx1.pem ;;
-    E*) root_ca_url=https://letsencrypt.org/certs/isrg-root-x2.pem ;;
-    *STAGING*)
-        if [[ "$root_cn" =~ \(STAGING\).*(R|E)[0-9]+$ ]]; then
-            case "${BASH_REMATCH[1]}" in
-            R) root_ca_url="https://letsencrypt.org/certs/staging/letsencrypt-stg-root-x1.pem" ;;
-            E) root_ca_url="https://letsencrypt.org/certs/staging/letsencrypt-stg-root-x2.pem" ;;
-            esac
-        fi
-        ;;
+        R*) root_ca_url=https://letsencrypt.org/certs/isrgrootx1.pem ;;
+        E*) root_ca_url=https://letsencrypt.org/certs/isrg-root-x2.pem ;;
+        *STAGING*)
+            if [[ "$root_cn" =~ \(STAGING\).*(R|E)[0-9]+$ ]]; then
+                case "${BASH_REMATCH[1]}" in
+                    R) root_ca_url="https://letsencrypt.org/certs/staging/letsencrypt-stg-root-x1.pem" ;;
+                    E) root_ca_url="https://letsencrypt.org/certs/staging/letsencrypt-stg-root-x2.pem" ;;
+                esac
+            fi
+            ;;
     esac
 
     if {
         curl -Sso /tmp/ISRG-root.pem "$root_ca_url"
-        cat "$chain_file" /tmp/ISRG-root.pem >"$zm_chainfile"
+        cat "$chain_file" /tmp/ISRG-root.pem > "$zm_chainfile"
         chown zimbra:zimbra "$zm_chainfile"
     }; then
         stage_result ok "Chain has been combined"
@@ -368,57 +368,57 @@ parse_args() {
 
     while [[ $# -ne 0 ]]; do
         case "$1" in
-        -c | --cert)
-            [[ ! -f "$2" ]] && die "Invalid certificate file."
-            zm_certfile="$2"
-            shift
-            ;;
-        -C | --chain)
-            [[ ! -f "$2" ]] && die "Invalid chain file."
-            zm_chainfile="$2"
-            shift
-            ;;
-        -p | --priv)
-            [[ ! -f "$2" ]] && die "Invalid private key file."
-            zm_privkeyfile="$2"
-            shift
-            ;;
-        -n | --name)
-            le_cert_name="$2"
-            shift
-            ;;
-        -e | --email)
-            le_email="$2"
-            shift
-            ;;
-        -w | --days)
-            [[ "$2" -gt 30 ]] && die "Let's Encrypt renewal period starts from 30 days before expiry. Cannot be higher than that, unless --force-getcert is set."
-            renew_days="$2"
-            shift
-            ;;
-        -d | --domain)
-            domains+=("$2")
-            shift
-            ;;
-        --force-getcert) le_forcegetcert=1 ;;
-        --force-getchain) le_forcegetchain=1 ;;
-        --noconfirm) noninteractive=1 ;;
-        --norestart) norestart=1 ;;
-        -h | --help) usage ;;
-        *)
-            if [[ -n "$action" ]]; then
-                die "Unknown option: $1"
-            fi
-
-            case "$1" in
-            cron | run | deploy | build-chain | get-cert | check-expiry | verify-cert)
-                action="$1"
+            -c | --cert)
+                [[ ! -f "$2" ]] && die "Invalid certificate file."
+                zm_certfile="$2"
+                shift
                 ;;
+            -C | --chain)
+                [[ ! -f "$2" ]] && die "Invalid chain file."
+                zm_chainfile="$2"
+                shift
+                ;;
+            -p | --priv)
+                [[ ! -f "$2" ]] && die "Invalid private key file."
+                zm_privkeyfile="$2"
+                shift
+                ;;
+            -n | --name)
+                le_cert_name="$2"
+                shift
+                ;;
+            -e | --email)
+                le_email="$2"
+                shift
+                ;;
+            -w | --days)
+                [[ "$2" -gt 30 ]] && die "Let's Encrypt renewal period starts from 30 days before expiry. Cannot be higher than that, unless --force-getcert is set."
+                renew_days="$2"
+                shift
+                ;;
+            -d | --domain)
+                domains+=("$2")
+                shift
+                ;;
+            --force-getcert) le_forcegetcert=1 ;;
+            --force-getchain) le_forcegetchain=1 ;;
+            --noconfirm) noninteractive=1 ;;
+            --norestart) norestart=1 ;;
+            -h | --help) usage ;;
             *)
-                positional+=("$1")
+                if [[ -n "$action" ]]; then
+                    die "Unknown option: $1"
+                fi
+
+                case "$1" in
+                    cron | run | deploy | build-chain | get-cert | check-expiry | verify-cert)
+                        action="$1"
+                        ;;
+                    *)
+                        positional+=("$1")
+                        ;;
+                esac
                 ;;
-            esac
-            ;;
         esac
         shift
     done
@@ -467,43 +467,43 @@ main() {
     fi
 
     case "$action" in
-    run)
-        info
-        cert_get 1
-        cert_get_chain
-        cert_verify
-        cert_deploy
-        services_restart
-        ;;
-    cron)
-        noninteractive=1
-        cert_check_expiry || exit
-        cert_get 1
-        cert_get_chain
-        cert_verify
-        cert_deploy
-        services_restart
-        ;;
-    deploy)
-        cert_verify
-        cert_deploy
-        echo "Do manual services restart: sudo -inu zimbra -- zmcontrol restart" >&2
-        ;;
-    get-cert)
-        info
-        cert_get 0
-        cert_get_chain
-        ;;
-    build-chain)
-        cert_get_chain
-        ;;
-    check-expiry)
-        unset le_forcegetcert
-        cert_check_expiry
-        ;;
-    verify-cert)
-        cert_verify
-        ;;
+        run)
+            info
+            cert_get 1
+            cert_get_chain
+            cert_verify
+            cert_deploy
+            services_restart
+            ;;
+        cron)
+            noninteractive=1
+            cert_check_expiry || exit
+            cert_get 1
+            cert_get_chain
+            cert_verify
+            cert_deploy
+            services_restart
+            ;;
+        deploy)
+            cert_verify
+            cert_deploy
+            echo "Do manual services restart: sudo -inu zimbra -- zmcontrol restart" >&2
+            ;;
+        get-cert)
+            info
+            cert_get 0
+            cert_get_chain
+            ;;
+        build-chain)
+            cert_get_chain
+            ;;
+        check-expiry)
+            unset le_forcegetcert
+            cert_check_expiry
+            ;;
+        verify-cert)
+            cert_verify
+            ;;
     esac
 
     rm -f "$lock_file"
