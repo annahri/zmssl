@@ -2,7 +2,7 @@
 # zmssl
 # author: ahfas.annahri@gmail.com
 
-version="0.3"
+version="0.3.1"
 
 # Variables
 lock_file=/tmp/zmssl_lock
@@ -412,7 +412,7 @@ parse_args() {
                 shift
                 ;;
             -n | --name)
-                grep -qoE -- '-(c|-cert|C|-chain|p|-priv)' <<< "${args_copy[*]}" && die "Cannot use -n/--name alongside with -c/--cert/-C/--chain/-p/--priv ."
+                grep -qowE -- '-(c|-cert|C|-chain|p|-priv)' <<< "${args_copy[*]}" && die "Cannot use -n/--name alongside with -c/--cert/-C/--chain/-p/--priv ."
                 le_cert_name="$2"
                 shift
                 ;;
