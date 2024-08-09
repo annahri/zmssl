@@ -2,7 +2,7 @@
 # zmssl
 # author: ahfas.annahri@gmail.com
 
-version="0.2"
+version="0.3"
 
 # Variables
 lock_file=/tmp/zmssl_lock
@@ -35,6 +35,9 @@ ACTIONS:
   cron          Same as run but checks for expiry first. 
   deploy        Only deploy existing cert or arbitrary one (via --cert).
   get-cert      Only gets the certificate.
+  copy-cert     Copies the certificate files (cert and privkey) to zm_ssl_dir.
+                Required for certain cases where this script is installed late
+                and the LE certificates already exist.
   check-expiry  Checks the cert expiry remaining days.
   build-chain   Build the certificate chain.
 
@@ -65,6 +68,7 @@ EXAMPLES:
   Certbot will store the certificates in /etc/letsencrypt/live/production
 
   Deploy a certificate using custom name:
+    ./zmssl build-chain -n custom-name  # Mandatory, to get the correct CA chain
     ./zmssl deploy -n custom-name
 
   Sample cron configuration to do renewal every 30 days, weekly checking:
@@ -321,15 +325,15 @@ cert_verify() {
     fi
 
     if [[ ! -f "$zm_certfile" ]]; then
-        die "Please get the initial certificate first (missing cert.pem) or invalid file"
+        die "Please get the initial certificate first (missing cert.pem) or do copy-certs or invalid file"
     fi
 
     if [[ ! -f "$zm_privkeyfile" ]]; then
-        die "Please get the initial certificate first (missing privkey.pem) or invalid file"
+        die "Please get the initial certificate first (missing privkey.pem) or do copy-certs or invalid file"
     fi
 
     if [[ ! -f "$zm_chainfile" ]]; then
-        die "Please get the root chain (missing chain-bundle.pem) or invalid file"
+        die "Please get the root chain (missing chain-bundle.pem) by running build-chain or invalid file"
     fi
 
     stage "Verifying certificate"
@@ -339,6 +343,18 @@ cert_verify() {
     fi
 
     stage_result ok "Verification successful"
+}
+
+cert_copy() {
+    if [[ -f "${zm_ssl_dir}/cert.pem" && -f "${zm_ssl_dir}/privkey.pem" && "$le_forcecopycerts" -ne 1 ]]; then
+        err "Certificates already exist in $zm_ssl_dir. Add --force-copy to overwrite existing certs."
+        exit
+    fi
+
+    cp_as "${le_dir}/cert.pem" "${zm_ssl_dir}/"
+    cp_as "${le_dir}/privkey.pem" "${zm_ssl_dir}/"
+
+    echo "Done copying certificates from $le_dir to $zm_ssl_dir"
 }
 
 cert_deploy() {
@@ -373,24 +389,30 @@ services_restart() {
 parse_args() {
     [[ $# -eq 0 ]] && usage
 
+    args_copy=("$@")
+
     while [[ $# -ne 0 ]]; do
         case "$1" in
             -c | --cert)
+                [[ "$le_cert_name" != "$le_cert_name_default" ]] && die "Option $1 and -n/--name are mutually exclusive"
                 [[ ! -f "$2" ]] && die "Invalid certificate file."
                 zm_certfile="$2"
                 shift
                 ;;
             -C | --chain)
+                [[ "$le_cert_name" != "$le_cert_name_default" ]] && die "Option $1 and -n/--name are mutually exclusive"
                 [[ ! -f "$2" ]] && die "Invalid chain file."
                 zm_chainfile="$2"
                 shift
                 ;;
             -p | --priv)
+                [[ "$le_cert_name" != "$le_cert_name_default" ]] && die "Option $1 and -n/--name are mutually exclusive"
                 [[ ! -f "$2" ]] && die "Invalid private key file."
                 zm_privkeyfile="$2"
                 shift
                 ;;
             -n | --name)
+                grep -qoE -- '-(c|-cert|C|-chain|p|-priv)' <<< "${args_copy[*]}" && die "Cannot use -n/--name alongside with -c/--cert/-C/--chain/-p/--priv ."
                 le_cert_name="$2"
                 shift
                 ;;
@@ -409,6 +431,7 @@ parse_args() {
                 ;;
             --force-getcert) le_forcegetcert=1 ;;
             --force-getchain) le_forcegetchain=1 ;;
+            --force-copy) le_forcecopycerts=1 ;;
             --noconfirm) noninteractive=1 ;;
             --norestart) norestart=1 ;;
             -h | --help) usage ;;
@@ -418,7 +441,7 @@ parse_args() {
                 fi
 
                 case "$1" in
-                    cron | run | deploy | build-chain | get-cert | check-expiry | verify-cert)
+                    cron | run | deploy | build-chain | get-cert | check-expiry | copy-cert | verify-cert)
                         action="$1"
                         ;;
                     *)
@@ -501,15 +524,18 @@ main() {
             cert_get 0
             cert_get_chain
             ;;
+        copy-cert)
+            cert_copy
+            ;;
+        verify-cert)
+            cert_verify
+            ;;
         build-chain)
             cert_get_chain
             ;;
         check-expiry)
             unset le_forcegetcert
             cert_check_expiry
-            ;;
-        verify-cert)
-            cert_verify
             ;;
     esac
 
