@@ -2,7 +2,7 @@
 # zmssl
 # author: ahfas.annahri@gmail.com
 
-version="0.3.1"
+version="0.4"
 
 # Variables
 lock_file=/tmp/zmssl_lock
@@ -11,20 +11,13 @@ domains=()
 renew_days=14
 le_opts=()
 le_email=
-le_cert_name_default="zimbra-ssl"
-le_cert_name="$le_cert_name_default"
-le_dir="/etc/letsencrypt/live/${le_cert_name}"
 le_forcegetcert=
-zm_ssl_dir="/opt/zimbra/ssl/letsencrypt"
-zm_comm_dir="/opt/zimbra/ssl/zimbra/commercial"
-zm_certfile="${zm_ssl_dir}/cert.pem"
-zm_privkeyfile="${zm_ssl_dir}/privkey.pem"
-zm_chainfile="${zm_ssl_dir}/chain-bundle.pem"
+
 seed=$(head /dev/urandom | tr -dc A-Za-z0-9 | head -c 6)
 
 usage() {
     cat << EOF
-zmssl v$version by annahri
+zmssl v$version by ahfas.annahri@gmail.com
 CLI tool for automating Let'sEncrpt SSL certificate issuance and deployment for Zimbra. (Initially written for Zimbra >= 9).
 This script requires "certbot" as the ACME client.
 
@@ -138,14 +131,27 @@ dependency_check() {
     command -v certbot &> /dev/null || die "Please install certbot"
 }
 
+set_vars() {
+    le_cert_name_default="${zmuser}-ssl"
+    le_cert_name="$le_cert_name_default"
+    le_dir="/etc/letsencrypt/live/${le_cert_name}"
+
+    zm_dir="/opt/${zmuser}"
+    zm_ssl_dir="${zm_dir}/ssl/letsencrypt"
+    zm_comm_dir="${zm_dir}/ssl/zimbra/commercial"
+    zm_certfile="${zm_ssl_dir}/cert.pem"
+    zm_privkeyfile="${zm_ssl_dir}/privkey.pem"
+    zm_chainfile="${zm_ssl_dir}/chain-bundle.pem"
+}
+
 run_as() {
     local tmplog="/tmp/zmssl_${1}_${seed}"
     # shellcheck disable=SC2024
-    sudo -inu zimbra -- "$@" &>> "$tmplog"
+    sudo -inu "$zmuser" -- "$@" &>> "$tmplog"
 }
 
 cp_as() {
-    install --owner zimbra --group zimbra --mode 640 --preserve-timestamps "$1" "$2"
+    install --owner "$zmuser" --group "$zmuser" --mode 640 --preserve-timestamps "$1" "$2"
 }
 
 is_port_free() {
@@ -469,6 +475,38 @@ info() {
 }
 
 main() {
+    # Check if zimbra or carbonio
+    if [[ -d "/opt/zimbra" ]]; then
+        zmuser=zimbra
+    elif [[ -d "/opt/zextras" ]]; then
+        zmuser=zextras
+    elif [[ -d "/opt/zimbra" && -d "/opt/zextras" ]]; then
+        if grep -q zimbra /etc/passwd; then
+            zmuser=zimbra
+        elif grep -q zextras /etc/passwd; then
+            zmuser=zextras
+        else
+            die "Unable to determine zimbra/zextras release."
+        fi
+    else
+        die "Unable to determine zimbra/zextras release."
+    fi
+
+    le_cert_name_default="${zmuser}-ssl"
+    le_cert_name="$le_cert_name_default"
+    le_dir="/etc/letsencrypt/live/${le_cert_name}"
+
+    zm_dir="/opt/${zmuser}"
+    zm_ssl_dir="${zm_dir}/ssl/letsencrypt"
+    zm_certfile="${zm_ssl_dir}/cert.pem"
+    zm_privkeyfile="${zm_ssl_dir}/privkey.pem"
+    zm_chainfile="${zm_ssl_dir}/chain-bundle.pem"
+    zm_comm_dir="${zm_dir}/ssl/zimbra/commercial"
+
+    if [[ "$zmuser" == "zextras" ]]; then
+        zm_comm_dir="${zm_dir}/ssl/carbonio/commercial"
+    fi
+
     parse_args "$@"
     mkdir -p "$zm_ssl_dir"
 
