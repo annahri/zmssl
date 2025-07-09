@@ -2,7 +2,10 @@
 # zmssl
 # author: ahfas.annahri@gmail.com
 
-version="0.4"
+CMD="$(basename "$0")"
+CMD_LOCATION="$(dirname "$(readlink -f "$0")")"
+
+VERSION="0.5"
 
 # Variables
 lock_file=/tmp/zmssl_lock
@@ -17,7 +20,7 @@ seed=$(head /dev/urandom | tr -dc A-Za-z0-9 | head -c 6)
 
 usage() {
     cat << EOF
-zmssl v$version by ahfas.annahri@gmail.com
+$CMD v$VERSION by ahfas.annahri@gmail.com
 CLI tool for automating Let'sEncrpt SSL certificate issuance and deployment for Zimbra. (Initially written for Zimbra >= 9).
 This script requires "certbot" as the ACME client.
 
@@ -131,19 +134,6 @@ dependency_check() {
     command -v certbot &> /dev/null || die "Please install certbot"
 }
 
-set_vars() {
-    le_cert_name_default="${zmuser}-ssl"
-    le_cert_name="$le_cert_name_default"
-    le_dir="/etc/letsencrypt/live/${le_cert_name}"
-
-    zm_dir="/opt/${zmuser}"
-    zm_ssl_dir="${zm_dir}/ssl/letsencrypt"
-    zm_comm_dir="${zm_dir}/ssl/zimbra/commercial"
-    zm_certfile="${zm_ssl_dir}/cert.pem"
-    zm_privkeyfile="${zm_ssl_dir}/privkey.pem"
-    zm_chainfile="${zm_ssl_dir}/chain-bundle.pem"
-}
-
 run_as() {
     local tmplog="/tmp/zmssl_${1}_${seed}"
     # shellcheck disable=SC2024
@@ -157,6 +147,24 @@ cp_as() {
 is_port_free() {
     local port="$1"
     ! : &> /dev/null < /dev/tcp/localhost/"$port"
+}
+
+check_variant() {
+    if [[ -d "/opt/zimbra" ]]; then
+        zmuser=zimbra
+    elif [[ -d "/opt/zextras" ]]; then
+        zmuser=zextras
+    elif [[ -d "/opt/zimbra" && -d "/opt/zextras" ]]; then
+        if grep -q zimbra /etc/passwd; then
+            zmuser=zimbra
+        elif grep -q zextras /etc/passwd; then
+            zmuser=zextras
+        else
+            die "Unable to determine zimbra/zextras release."
+        fi
+    else
+        die "Unable to determine zimbra/zextras release."
+    fi
 }
 
 zmproxy_start() {
@@ -219,7 +227,6 @@ cert_check_expiry() {
 
 cert_get() {
     # Accepts 1 argument (either 0 or 1), if given 1 then proxy won't started after being stopped.
-
     local certbot_log
     local return_status=0
     local no_proxy_start="${1:-0}"
@@ -392,6 +399,18 @@ services_restart() {
     stage_result ok "Restarted Zimbra services"
 }
 
+info() {
+    [[ "${domains[*]}" ]] &&
+        echo "                        Domains : ${domains[*]}"
+    [[ "$le_email" ]] &&
+        echo "    Let's Encrypt email address : $le_email"
+    echo " Let's Encrypt Certificate name : $le_cert_name"
+    echo "               Certificate file : $zm_certfile"
+    echo "                     Chain file : $zm_chainfile"
+    echo "               Private key file : $zm_privkeyfile"
+    prompt "Ensure the values are correct."
+}
+
 parse_args() {
     [[ $# -eq 0 ]] && usage
 
@@ -431,6 +450,11 @@ parse_args() {
                 renew_days="$2"
                 shift
                 ;;
+            -l | --le-dir)
+                [[ ! -d "$2" ]] && die "Invalid Let's Encrypt base directory: $2"
+                le_base_dir="$2"
+                shift
+                ;;
             -d | --domain)
                 domains+=("$2")
                 shift
@@ -458,43 +482,16 @@ parse_args() {
         esac
         shift
     done
-
-    le_dir="/etc/letsencrypt/live/${le_cert_name}"
-}
-
-info() {
-    [[ "${domains[*]}" ]] &&
-        echo "                        Domains : ${domains[*]}"
-    [[ "$le_email" ]] &&
-        echo "    Let's Encrypt email address : $le_email"
-    echo " Let's Encrypt Certificate name : $le_cert_name"
-    echo "               Certificate file : $zm_certfile"
-    echo "                     Chain file : $zm_chainfile"
-    echo "               Private key file : $zm_privkeyfile"
-    prompt "Ensure the values are correct."
 }
 
 main() {
-    # Check if zimbra or carbonio
-    if [[ -d "/opt/zimbra" ]]; then
-        zmuser=zimbra
-    elif [[ -d "/opt/zextras" ]]; then
-        zmuser=zextras
-    elif [[ -d "/opt/zimbra" && -d "/opt/zextras" ]]; then
-        if grep -q zimbra /etc/passwd; then
-            zmuser=zimbra
-        elif grep -q zextras /etc/passwd; then
-            zmuser=zextras
-        else
-            die "Unable to determine zimbra/zextras release."
-        fi
-    else
-        die "Unable to determine zimbra/zextras release."
-    fi
+    parse_args "$@"
+    check_variant
 
+    le_base_dir="${le_base_dir:-/etc/letsencrypt/live}"
     le_cert_name_default="${zmuser}-ssl"
     le_cert_name="$le_cert_name_default"
-    le_dir="/etc/letsencrypt/live/${le_cert_name}"
+    le_dir="${le_base_dir}/${le_cert_name}"
 
     zm_dir="/opt/${zmuser}"
     zm_ssl_dir="${zm_dir}/ssl/letsencrypt"
@@ -503,11 +500,8 @@ main() {
     zm_chainfile="${zm_ssl_dir}/chain-bundle.pem"
     zm_comm_dir="${zm_dir}/ssl/zimbra/commercial"
 
-    if [[ "$zmuser" == "zextras" ]]; then
-        zm_comm_dir="${zm_dir}/ssl/carbonio/commercial"
-    fi
+    [[ "$zmuser" == "zextras" ]] && zm_comm_dir="${zm_dir}/ssl/carbonio/commercial"
 
-    parse_args "$@"
     mkdir -p "$zm_ssl_dir"
 
     if [[ -f "$lock_file" ]]; then
