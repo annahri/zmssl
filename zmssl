@@ -5,7 +5,7 @@
 CMD="$(basename "$0")"
 CMD_LOCATION="$(dirname "$(readlink -f "$0")")"
 
-VERSION="0.6"
+VERSION="0.6.1"
 
 # Variables
 lock_file=/tmp/zmssl_lock
@@ -369,7 +369,7 @@ cert_get_chain() {
     if {
         curl -Sso /tmp/ISRG-root.pem "$root_ca_url"
         cat "$chain_file" /tmp/ISRG-root.pem > "$zm_chainfile"
-        chown zimbra:zimbra "$zm_chainfile"
+        chown "$zmuser":"$zmuser" "$zm_chainfile" 2> /dev/null
     }; then
         stage_result ok "Chain has been combined"
     else
