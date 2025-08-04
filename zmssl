@@ -5,7 +5,7 @@
 CMD="$(basename "$0")"
 CMD_LOCATION="$(dirname "$(readlink -f "$0")")"
 
-VERSION="0.5"
+VERSION="0.6"
 
 # Variables
 lock_file=/tmp/zmssl_lock
@@ -21,14 +21,14 @@ seed=$(head /dev/urandom | tr -dc A-Za-z0-9 | head -c 6)
 usage() {
     cat << EOF
 $CMD v$VERSION by ahfas.annahri@gmail.com
-CLI tool for automating Let'sEncrpt SSL certificate issuance and deployment for Zimbra. (Initially written for Zimbra >= 9).
+CLI tool for automating Let'sEncrpt SSL certificate issuance and deployment for Zimbra/Carbonio. (Initially written for Zimbra >= 9).
 This script requires "certbot" as the ACME client.
 
 USAGE: zmssl [options] <action> -d ...
 
 ACTIONS:
   run           Gets the cert + chain and deploys it.
-  cron          Same as run but checks for expiry first. 
+  cron          Same as run but checks for expiry first.
   deploy        Only deploy existing cert or arbitrary one (via --cert).
   get-cert      Only gets the certificate.
   copy-cert     Copies the certificate files (cert and privkey) to zm_ssl_dir.
@@ -41,22 +41,25 @@ OPTIONS:
   -d --domain <domain>  Domain names. Can be set multiple times for SAN. Required for: run, cron.
   -c --cert <file>      Specify custom certificate file instead of LE's live cert.
   -C --chain <file>     Specify custom chain file instead of LE's live chain bundle.
-  -p --priv <file>      Specify custom private key file instead of LE's live privkey. 
+  -p --priv <file>      Specify custom private key file instead of LE's live privkey.
   -n --name <name>      Set the name of the certificate. Default: zimbra-ssl.
   -e --email <address>  Specify email address for ACME. Optional.
   -w --days <int>       Set the days within renewal. Cannot be higher than 30. Dafault: 14 (2 weeks)
-  
+
   --force-getcert       Force to get the certificate even if it's not within renewal days.
   --force-getchain      Force to "re-create" the chain bundle.
+  --force-copy          Force to copy the certificates (overwrites existing).
+
   --noconfirm           Auto approve all prompts.
+  --norestart           Do not perform services restart.
 
   -h --help             Display this help information.
 
 LIMITATIONS:
-  Currently, the only supported domain control validation method is HTTP validation. 
+  Currently, the only supported domain control validation method is HTTP validation.
 
 EXAMPLES:
-  Interactively get a certificate named "production" for mail.example.com and mail.example.id, 
+  Interactively get a certificate named "production" for mail.example.com and mail.example.id,
   deploys it and restarts Zimbra services. Also send expiry notifications to admin@example.com:
 
     ./zmssl run -n production -d mail.example.com -d mail.example.id -e admin@example.com
@@ -134,37 +137,74 @@ dependency_check() {
     command -v certbot &> /dev/null || die "Please install certbot"
 }
 
+# Compare 2 version strings if one is greater than the other
+# usage: version_ge "ver" "required_ver"
+version_ge() {
+    [[ "$(printf '%s\n' "$2" "$1" | sort -V | head -n1)" == "$2" ]]
+}
+
+# Run zimbra commands as $zmuser user
 run_as() {
     local tmplog="/tmp/zmssl_${1}_${seed}"
     # shellcheck disable=SC2024
     sudo -inu "$zmuser" -- "$@" &>> "$tmplog"
 }
 
+sys() {
+    local cmd="$1"
+    local unit="$2"
+    local tmplog="/tmp/zmssl_${unit%.*}_${seed}"
+    systemctl "$cmd" "$unit" &>> "$tmplog"
+}
+
+# Copy files as $zmuser user preserving timestamp with 640 mode
 cp_as() {
     install --owner "$zmuser" --group "$zmuser" --mode 640 --preserve-timestamps "$1" "$2"
 }
 
+# Checks whether $port is available
 is_port_free() {
     local port="$1"
     ! : &> /dev/null < /dev/tcp/localhost/"$port"
 }
 
-check_variant() {
+# Gather facts about existing zimbra installation
+# whether it's zimbra or carbonio
+get_facts() {
+    # If it's zimbra
     if [[ -d "/opt/zimbra" ]]; then
         zmuser=zimbra
-    elif [[ -d "/opt/zextras" ]]; then
+        zmversion="$(run_as zmcontrol -v | awk '{print $2}')"
+        variant=Zimbra
+        return
+    fi
+
+    # If it's carbonio
+    if [[ -d "/opt/zextras" ]]; then
         zmuser=zextras
-    elif [[ -d "/opt/zimbra" && -d "/opt/zextras" ]]; then
+        zmversion="$(run_as zmcontrol -v | awk '{print $NF}')"
+        variant=Carbonio
+        return
+    fi
+
+    # If both exists (?) which is unlikely btw
+    if [[ -d "/opt/zimbra" && -d "/opt/zextras" ]]; then
         if grep -q zimbra /etc/passwd; then
             zmuser=zimbra
-        elif grep -q zextras /etc/passwd; then
-            zmuser=zextras
-        else
-            die "Unable to determine zimbra/zextras release."
+            zmversion="$(run_as zmcontrol -v | awk '{print $2}')"
+            variant=Zimbra
+            return
         fi
-    else
-        die "Unable to determine zimbra/zextras release."
+
+        if grep -q zextras /etc/passwd; then
+            zmuser=zextras
+            zmversion="$(run_as zmcontrol -v | awk '{print $NF}')"
+            variant=Carbonio
+            return
+        fi
     fi
+
+    die "Unable to determine zimbra/zextras release."
 }
 
 zmproxy_start() {
@@ -173,9 +213,14 @@ zmproxy_start() {
         return
     fi
 
-    stage "Starting Zimbra Proxy"
-    run_as zmproxyctl start
-    stage_result ok "Started Zimbra Proxy"
+    stage "Starting $variant Proxy"
+
+    if [[ "$zmuser" == "zextras" ]] && version_ge "$zmversion" "25.6"; then
+        sys start carbonio-proxy
+    else
+        run_as zmproxyctl start
+    fi
+    stage_result ok "Started $variant Proxy"
 }
 
 zmproxy_stop() {
@@ -184,9 +229,13 @@ zmproxy_stop() {
         return
     fi
 
-    stage "Stopping Zimbra Proxy"
-    run_as zmproxyctl stop
-    stage_result ok "Stopped Zimbra Proxy"
+    stage "Stopping $variant Proxy"
+    if [[ "$zmuser" == "zextras" ]] && version_ge "$zmversion" "25.6"; then
+        sys stop carbonio-proxy
+    else
+        run_as zmproxyctl stop
+    fi
+    stage_result ok "Stopped $variant Proxy"
 }
 
 cert_cn_get() {
@@ -247,7 +296,7 @@ cert_get() {
         le_domains+=(-d "$domain")
     done
 
-    prompt "Getting certificate requires stopping Zimbra proxy."
+    prompt "Getting certificate requires stopping $variant proxy."
 
     if ! is_port_free 80; then
         zmproxy_stop
@@ -385,18 +434,27 @@ cert_deploy() {
 services_restart() {
     if [[ "$norestart" -eq 1 ]]; then
         echo "You can manually restart the services via:"
-        echo "  sudo -iu zimbra -- zmcontrol restart"
+        echo "  sudo -iu $zmuser -- zmcontrol restart"
         return
     fi
 
-    prompt "About to restart Zimbra services"
+    prompt "About to restart $variant services"
 
-    stage "Restarting Zimbra services"
-    if ! run_as zmcontrol restart; then
-        stage_result fail "Failed to restart Zimbra services. Check /tmp/zmssl_zmcontrol_$seed for details"
-        exit 1
+    stage "Restarting $variant services"
+    if [[ "$zmuser" == "zextras" ]] && version_ge "$zmversion" "25.6"; then
+        # Verify version as the method differs since 25.6
+        if ! sys restart carbonio.target; then
+            stage_result fail "Failed to restart Carbonio services. Check /tmp/zmssl_carbonio_$seed for details"
+            exit 1
+        fi
+    else
+        if ! run_as zmcontrol restart; then
+            stage_result fail "Failed to restart $variant services. Check /tmp/zmssl_zmcontrol_$seed for details"
+            exit 1
+        fi
     fi
-    stage_result ok "Restarted Zimbra services"
+
+    stage_result ok "Restarted $variant services"
 }
 
 info() {
@@ -486,7 +544,7 @@ parse_args() {
 
 main() {
     parse_args "$@"
-    check_variant
+    get_facts
 
     le_base_dir="${le_base_dir:-/etc/letsencrypt/live}"
     le_cert_name_default="${zmuser}-ssl"
